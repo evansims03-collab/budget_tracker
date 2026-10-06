@@ -6,13 +6,12 @@ Updated Wed Sep 2
 
 @author: evansims
 """
-#pip install streamlit pandas plotly
-#streamlit run app.py
 from datetime import date, datetime
 import sqlite3
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 DB_NAME = "finance_tracker.db"
@@ -372,13 +371,14 @@ with h_col1:
 with h_col2:
     current_dt = date.today()
     month_options = []
-    for m_idx in range(12):
+    # Build 24 rolling months centered around current year
+    for m_idx in range(24):
         yr = 2026 + (m_idx // 12)
         mo = (m_idx % 12) + 1
         month_options.append(date(yr, mo, 1))
 
     month_labels = [d.strftime("%B %Y") for d in month_options]
-    default_idx = next((i for i, d in enumerate(month_options) if d.year == current_dt.year and d.month == current_dt.month), 7)
+    default_idx = next((i for i, d in enumerate(month_options) if d.year == current_dt.year and d.month == current_dt.month), 0)
     
     selected_label = st.selectbox("Month Horizon", options=month_labels, index=default_idx)
     selected_month_date = month_options[month_labels.index(selected_label)]
@@ -570,34 +570,78 @@ if current_tab == "Home":
         st.info("No living expense transactions recorded for this month yet.")
 
 # ==============================================================================
-# SCREEN 2: ANALYSIS
+# SCREEN 2: ANALYSIS (Net Expenses MoM & Cumulative Trajectory)
 # ==============================================================================
 elif current_tab == "Analysis":
     st.markdown("### Spending Analysis")
     
     an_col1, an_col2 = st.columns(2, gap="large")
     with an_col1:
-        st.markdown("<div class='card-shell'><p class='card-shell-header'>Month-to-Month Trend</p>", unsafe_allow_html=True)
+        st.markdown("<div class='card-shell'><p class='card-shell-header'>Net Budget Performance & Cumulative Trajectory</p>", unsafe_allow_html=True)
         if not trans_df.empty:
-            month_totals = trans_df.groupby("month")["amount"].sum().reset_index()
-            fig_hist = px.bar(
-                month_totals,
-                x="month",
-                y="amount",
-                color_discrete_sequence=["#FF5E7E"],
-                text_auto=".2s",
+            total_monthly_target = cats_df["monthly_target"].sum()
+            month_totals = trans_df.groupby("month")["amount"].sum().reset_index().sort_values("month")
+            
+            # Net Difference = Target - Actual Spent
+            # Positive = Under Budget (Surplus) | Negative = Over Budget (Deficit)
+            month_totals["net_difference"] = total_monthly_target - month_totals["amount"]
+            month_totals["cumulative_net"] = month_totals["net_difference"].cumsum()
+            month_totals["color"] = month_totals["net_difference"].apply(lambda v: "#0f3923" if v >= 0 else "#E74C3C")
+            
+            # Build Overlay Chart (Bar for monthly variance, Line for cumulative)
+            fig_trend = make_subplots(specs=[[{"secondary_y": True}]])
+            
+            # 1. Bar Chart: Monthly Net Surplus/Deficit
+            fig_trend.add_trace(
+                go.Bar(
+                    x=month_totals["month"],
+                    y=month_totals["net_difference"],
+                    name="Net Month Diff",
+                    marker_color=month_totals["color"],
+                    hovertemplate="%{x}<br>Net: $%{y:,.2f}<extra></extra>"
+                ),
+                secondary_y=False
             )
-            fig_hist.update_layout(
+            
+            # 2. Line Chart: Cumulative Net Position
+            fig_trend.add_trace(
+                go.Scatter(
+                    x=month_totals["month"],
+                    y=month_totals["cumulative_net"],
+                    name="Cumulative Net",
+                    mode="lines+markers",
+                    line=dict(color="#1A5638", width=3),
+                    marker=dict(size=7, color="#0f3923"),
+                    hovertemplate="%{x}<br>Cumulative Net: $%{y:,.2f}<extra></extra>"
+                ),
+                secondary_y=True
+            )
+            
+            fig_trend.update_layout(
                 plot_bgcolor="rgba(0,0,0,0)",
                 paper_bgcolor="rgba(0,0,0,0)",
                 xaxis=dict(title="Month", showgrid=False),
-                yaxis=dict(title="", showgrid=True, gridcolor="rgba(0,0,0,0.06)"),
-                height=350,
+                yaxis=dict(
+                    title="Monthly Variance ($)",
+                    zeroline=True,
+                    zerolinewidth=2,
+                    zerolinecolor="#6C7E76",
+                    showgrid=True,
+                    gridcolor="rgba(0,0,0,0.06)"
+                ),
+                yaxis2=dict(
+                    title="Cumulative Position ($)",
+                    showgrid=False,
+                    overlaying="y",
+                    side="right"
+                ),
+                height=360,
                 margin=dict(l=10, r=10, t=20, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
-            st.plotly_chart(fig_hist, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(fig_trend, use_container_width=True, config={"displayModeBar": False})
         else:
-            st.info("Record transactions to populate monthly trends.")
+            st.info("Record transactions to populate net monthly trends.")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with an_col2:
@@ -755,7 +799,7 @@ elif current_tab == "+":
                     st.rerun()
 
 # ==============================================================================
-# SCREEN 3: SAVINGS (With One-Click Monthly Deposit Engine)
+# SCREEN 3: SAVINGS (With Big Investment & Other Sinking Funds Split)
 # ==============================================================================
 elif current_tab == "Savings":
     st.markdown("### Savings & Sinking Funds")
@@ -794,6 +838,7 @@ elif current_tab == "Savings":
         b_rows.append({"Bucket": b_name, "Rate": b["monthly_allocation"], "Balance": deps - withd})
     b_df = pd.DataFrame(b_rows)
 
+    # Calculate Reimbursement Due for the Month
     if not bucket_ledger_df.empty:
         bucket_ledger_df["month"] = pd.to_datetime(bucket_ledger_df["date"]).dt.strftime("%Y-%m")
         month_withdrawals = bucket_ledger_df[(bucket_ledger_df["month"] == active_month_str) & (bucket_ledger_df["type"] == "Withdrawal")]
@@ -802,21 +847,52 @@ elif current_tab == "Savings":
         month_withdrawals = pd.DataFrame()
         transfer_sum = 0.0
 
-    st.markdown(
-        f"""
-        <div class="card-shell" style="background: linear-gradient(135deg, #0f3923 0%, #1c5e3d 100%); color:white;">
-            <p style="margin:0; font-size:0.85rem; color:#A7C4B5; text-transform:uppercase; font-weight:700;">Reimbursement to Checking ({selected_month_date.strftime('%B %Y')})</p>
-            <h1 style="margin:6px 0; font-size:2.4rem; font-weight:800; color:white;">${transfer_sum:,.2f}</h1>
-            <p style="margin:0; font-size:0.9rem; color:#D3E3DA;">Lump-sum to transfer from Savings into Checking to cover bucket outflows.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    # Calculate Savings Balances (Split into Big Investment vs. Other Buckets)
+    big_inv_balance = b_df[b_df["Bucket"] == "Big investment"]["Balance"].sum() if not b_df.empty else 0.0
+    other_buckets_balance = b_df[b_df["Bucket"] != "Big investment"]["Balance"].sum() if not b_df.empty else 0.0
+    total_savings_balance = big_inv_balance + other_buckets_balance
+
+    # Top Metrics Bar: Reimbursement Card + Big Investment Card + Other Sinking Funds Card
+    top_col1, top_col2, top_col3 = st.columns(3, gap="medium")
+    with top_col1:
+        st.markdown(
+            f"""
+            <div class="card-shell" style="background: linear-gradient(135deg, #0f3923 0%, #1c5e3d 100%); color:white; min-height: 140px;">
+                <p style="margin:0; font-size:0.8rem; color:#A7C4B5; text-transform:uppercase; font-weight:700;">Reimbursement to Checking</p>
+                <h2 style="margin:4px 0; font-size:2rem; font-weight:800; color:white;">${transfer_sum:,.2f}</h2>
+                <p style="margin:0; font-size:0.8rem; color:#D3E3DA;">Due from savings for {selected_month_date.strftime('%B %Y')}.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with top_col2:
+        st.markdown(
+            f"""
+            <div class="card-shell" style="min-height: 140px;">
+                <p class="card-shell-header">Big Investment Fund</p>
+                <h2 style="margin:4px 0; font-size:2rem; font-weight:800; color:#0f3923;">${big_inv_balance:,.2f}</h2>
+                <p style="margin:0; font-size:0.8rem; color:#6C7E76;">Isolated long-term investment bucket.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with top_col3:
+        st.markdown(
+            f"""
+            <div class="card-shell" style="min-height: 140px;">
+                <p class="card-shell-header">Other Sinking Funds</p>
+                <h2 style="margin:4px 0; font-size:2rem; font-weight:800; color:#0f3923;">${other_buckets_balance:,.2f}</h2>
+                <p style="margin:0; font-size:0.8rem; color:#6C7E76;">Total across all remaining funds (Total: ${total_savings_balance:,.2f}).</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     if transfer_sum > 0:
         with st.expander("📋 View Reimbursement Itemization", expanded=False):
             st.dataframe(month_withdrawals[["date", "bucket_name", "amount", "note"]].rename(columns={"bucket_name": "Bucket", "amount": "Amount", "note": "Reason"}), use_container_width=True)
 
+    # Diverging $0 Solvency Bar Chart
     st.markdown("#### Bucket Solvency ($0 Centered)")
     all_b_names = b_df["Bucket"].tolist()
     sel_buckets = st.multiselect("Filter Buckets", all_b_names, default=all_b_names)
@@ -844,6 +920,7 @@ elif current_tab == "Savings":
         )
         st.plotly_chart(fig_solv, use_container_width=True, config={"displayModeBar": False})
 
+    # Manual Deposit / Withdrawal Section
     st.markdown("#### Log Savings Inflow / Outflow")
     with st.form("manual_bucket_log"):
         mb1, mb2, mb3, mb4 = st.columns(4)
@@ -863,7 +940,7 @@ elif current_tab == "Savings":
                 c_conn.commit()
             st.session_state["pending_toast"] = f"{m_type} of ${m_amt:,.2f} recorded for {m_target}."
             st.rerun()
-            
+
     # Editable Past Savings Ledger
     st.markdown("#### Manage Past Bucket Entries")
     with st.expander("✏️ View & Edit Past Savings Ledger", expanded=False):
