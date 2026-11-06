@@ -141,6 +141,11 @@ def init_db():
             )
         """)
         c.execute("""
+            CREATE TABLE IF NOT EXISTS posted_paychecks (
+                month TEXT PRIMARY KEY
+            )
+        """)
+        c.execute("""
             CREATE TABLE IF NOT EXISTS keyword_rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 keyword TEXT UNIQUE,
@@ -171,7 +176,6 @@ def init_db():
             )
         """)
 
-        # Seeds
         c.execute("SELECT COUNT(*) FROM categories")
         if c.fetchone()[0] == 0:
             c.executemany("INSERT INTO categories (name, monthly_target) VALUES (?, ?)", [(k, v) for k, v in DEFAULT_EXPENSE_CATEGORIES.items()])
@@ -337,7 +341,7 @@ st.markdown(
     }
     .stRadio > div[role="radiogroup"] label:nth-child(3) div[data-testid="stMarkdownContainer"] {
         background: #185c37 !important;
-        color: #FFFFFF !important;
+        color: transparent !important;
         width: 46px !important;
         height: 46px !important;
         border-radius: 50% !important;
@@ -348,14 +352,22 @@ st.markdown(
         box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35) !important;
         border: 2px solid rgba(255, 255, 255, 0.25) !important;
         margin: -8px 4px !important;
+        position: relative;
+    }
+    .stRadio > div[role="radiogroup"] label:nth-child(3) div[data-testid="stMarkdownContainer"]::after {
+        content: '+';
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        font-size: 2.2rem;
+        font-weight: 400;
+        color: #FFFFFF;
+        line-height: 0;
+        padding-bottom: 4px;
     }
     .stRadio > div[role="radiogroup"] label:nth-child(3) div[data-testid="stMarkdownContainer"] p {
-        font-size: 1.7rem !important;
-        font-weight: 900 !important;
-        line-height: 1 !important;
-        margin: 0 !important;
-        padding: 0 !important;
-        color: #FFFFFF !important;
+        display: none !important;
     }
     </style>
     """,
@@ -421,6 +433,25 @@ else:
     month_income = 0.0
 
 active_month_boosts = pd.read_sql("SELECT category, SUM(amount) as boost_amt FROM category_boosts WHERE month=? GROUP BY category", conn, params=(active_month_str,))
+
+# Compute Global Automation States
+monthly_paycheck_val = get_setting("monthly_paycheck")
+paycheck_posted = True
+if monthly_paycheck_val > 0:
+    paycheck_posted = not pd.read_sql("SELECT 1 FROM posted_paychecks WHERE month = ?", conn, params=(active_month_str,)).empty
+
+savings_posted = not pd.read_sql("SELECT 1 FROM posted_bucket_deposits WHERE month = ?", conn, params=(active_month_str,)).empty
+
+posted_records = pd.read_sql("SELECT rule_id FROM posted_recurring WHERE month = ?", conn, params=(active_month_str,))
+posted_ids = set(posted_records["rule_id"].tolist()) if not posted_records.empty else set()
+unposted_bills = recurring_df[~recurring_df["id"].isin(posted_ids)]
+bills_posted = unposted_bills.empty
+
+all_automations_done = paycheck_posted and savings_posted and bills_posted
+
+# NEW: Determine if ANY single automation has already been processed manually
+paycheck_applicable_and_posted = (monthly_paycheck_val > 0) and paycheck_posted
+any_automation_done = bills_posted or savings_posted or paycheck_applicable_and_posted
 
 # --- Chart Helpers ---
 def render_hero_donut_spent(spent, target):
@@ -530,26 +561,8 @@ if current_tab == "Home":
     with hero_col2:
         st.markdown("<div class='card-shell'><p class='card-shell-header'>Target Diagnostics</p>", unsafe_allow_html=True)
         m1, m2 = st.columns(2)
-        m1.metric("Total Budget Cap", f"${total_budget:,.2f}")
-        m2.metric("Total Income", f"${month_income:,.2f}")
-        
-        posted_records = pd.read_sql("SELECT rule_id FROM posted_recurring WHERE month = ?", conn, params=(active_month_str,))
-        posted_ids = set(posted_records["rule_id"].tolist()) if not posted_records.empty else set()
-        unposted = recurring_df[~recurring_df["id"].isin(posted_ids)]
-
-        st.markdown("<div style='margin-top: 18px;'></div>", unsafe_allow_html=True)
-        if not unposted.empty:
-            st.warning(f"Notice: {len(unposted)} recurring bills pending for {selected_month_date.strftime('%B')} (${unposted['amount'].sum():,.2f})")
-            if st.button("Post Monthly Recurring Bills", type="primary"):
-                with get_db() as c_conn:
-                    for _, r_bill in unposted.iterrows():
-                        c_conn.execute("INSERT INTO transactions (date, category, amount, note) VALUES (?, ?, ?, ?)", (selected_month_date.strftime("%Y-%m-01"), r_bill["category"], r_bill["amount"], f"[Recurring] {r_bill['name']}"))
-                        c_conn.execute("INSERT INTO posted_recurring (month, rule_id) VALUES (?, ?)", (active_month_str, int(r_bill["id"])))
-                    c_conn.commit()
-                st.session_state["pending_toast"] = f"Posted recurring bills for {selected_month_date.strftime('%B')}."
-                st.rerun()
-        else:
-            st.success("All recurring monthly bills are logged.")
+        m1.metric("Total Monthly Budget", f"${total_budget:,.2f}")
+        m2.metric("Total Monthly Income", f"${month_income:,.2f}")
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("### Category Allocations")
@@ -558,7 +571,6 @@ if current_tab == "Home":
     for idx, (_, c_row) in enumerate(cats_df.iterrows()):
         c_name = c_row["name"]
         
-        # Calculate individual boost capacity
         c_boost = active_month_boosts[active_month_boosts["category"] == c_name]["boost_amt"].sum() if not active_month_boosts.empty else 0.0
         c_target = c_row["monthly_target"] + c_boost
         
@@ -611,13 +623,11 @@ elif current_tab == "Analysis":
         if not trans_df.empty:
             total_monthly_base_target = cats_df["monthly_target"].sum()
             
-            # Reconstruct net difference month by month considering active boosts
             all_boosts_df = pd.read_sql("SELECT month, SUM(amount) as total_boost FROM category_boosts GROUP BY month", conn)
             month_totals = trans_df.groupby("month")["amount"].sum().reset_index().sort_values("month")
             month_totals = pd.merge(month_totals, all_boosts_df, on="month", how="left").fillna(0)
             month_totals["effective_target"] = total_monthly_base_target + month_totals["total_boost"]
             
-            # Positive = Under Budget | Negative = Over Budget
             month_totals["net_difference"] = month_totals["effective_target"] - month_totals["amount"]
             month_totals["cumulative_net"] = month_totals["net_difference"].cumsum()
             month_totals["color"] = month_totals["net_difference"].apply(lambda v: "#0f3923" if v >= 0 else "#E74C3C")
@@ -641,8 +651,8 @@ elif current_tab == "Analysis":
                     y=month_totals["cumulative_net"],
                     name="Cumulative Net",
                     mode="lines+markers",
-                    line=dict(color="#1A5638", width=3),
-                    marker=dict(size=7, color="#0f3923"),
+                    line=dict(color="#54A0FF", width=3),
+                    marker=dict(size=7, color="#54A0FF"),
                     hovertemplate="%{x}<br>Cumulative Net: $%{y:,.2f}<extra></extra>"
                 ),
                 secondary_y=True
@@ -653,7 +663,8 @@ elif current_tab == "Analysis":
                 paper_bgcolor="rgba(0,0,0,0)",
                 xaxis=dict(title="Month", showgrid=False),
                 yaxis=dict(
-                    title="Monthly Variance ($)",
+                    title=dict(text="Monthly Variance ($)", font=dict(color="#0f3923")),
+                    tickfont=dict(color="#0f3923"),
                     zeroline=True,
                     zerolinewidth=2,
                     zerolinecolor="#6C7E76",
@@ -661,7 +672,8 @@ elif current_tab == "Analysis":
                     gridcolor="rgba(0,0,0,0.06)"
                 ),
                 yaxis2=dict(
-                    title="Cumulative Position ($)",
+                    title=dict(text="Cumulative Position ($)", font=dict(color="#54A0FF")),
+                    tickfont=dict(color="#54A0FF"),
                     showgrid=False,
                     overlaying="y",
                     side="right"
@@ -695,7 +707,7 @@ elif current_tab == "Analysis":
             fig_pie.update_layout(
                 showlegend=False,
                 height=390,
-                margin=dict(l=30, r=30, t=20, b=40),
+                margin=dict(l=65, r=65, t=25, b=45),
             )
             st.plotly_chart(fig_pie, use_container_width=True, config={"displayModeBar": False})
         else:
@@ -706,9 +718,61 @@ elif current_tab == "Analysis":
 # ACTION MODAL: +
 # ==============================================================================
 elif current_tab == "+":
-    st.markdown("### Add Transactions & Inflow")
+    st.markdown("### Transaction & Fund Controls")
     
-    tab_exp, tab_inc, tab_edit, tab_import = st.tabs(["Record Expense", "Log Income", "Edit Logged Transactions", "Import Statement (.CSV)"])
+    st.markdown("<div class='card-shell' style='padding: 20px; margin-bottom: 24px;'>", unsafe_allow_html=True)
+    
+    if all_automations_done:
+        st.success(f"✅ All monthly automations for {selected_month_date.strftime('%B %Y')} processed.")
+    else:
+        # Only show the Master Button if NO automations have been run yet
+        if not any_automation_done:
+            st.info("⚡ **One-Step Monthly DepositAutomations**")
+            if st.button("Post All Monthly Recurring Bills, Paychecks, and Savings Deposits", type="primary", use_container_width=True):
+                deposit_date_str = selected_month_date.strftime("%Y-%m-01")
+                with get_db() as c_conn:
+                    if not bills_posted:
+                        for _, r_bill in unposted_bills.iterrows():
+                            c_conn.execute("INSERT INTO transactions (date, category, amount, note) VALUES (?, ?, ?, ?)", (deposit_date_str, r_bill["category"], r_bill["amount"], f"[Recurring] {r_bill['name']}"))
+                        c_conn.execute("INSERT INTO posted_recurring (month, rule_id) SELECT ?, id FROM recurring_rules WHERE is_active=1", (active_month_str,))
+                    
+                    if not savings_posted:
+                        for _, b_row in buckets_df.iterrows():
+                            alloc_amt = float(b_row["monthly_allocation"])
+                            if alloc_amt > 0:
+                                c_conn.execute("INSERT INTO bucket_ledger (date, bucket_name, type, amount, note) VALUES (?, ?, 'Manual Deposit', ?, ?)", (deposit_date_str, b_row["name"], alloc_amt, f"Monthly Allocation for {selected_month_date.strftime('%B %Y')}"))
+                        c_conn.execute("INSERT INTO posted_bucket_deposits (month) VALUES (?)", (active_month_str,))
+
+                    if not paycheck_posted and monthly_paycheck_val > 0:
+                        c_conn.execute("INSERT INTO income_logs (date, amount, source) VALUES (?, ?, ?)", (deposit_date_str, monthly_paycheck_val, "Monthly Paycheck"))
+                        c_conn.execute("INSERT INTO posted_paychecks (month) VALUES (?)", (active_month_str,))
+                        
+                    c_conn.commit()
+                st.session_state["pending_toast"] = f"✅ All pending automations for {selected_month_date.strftime('%B')} processed!"
+                st.rerun()
+            st.markdown("<hr style='margin: 16px 0;'>", unsafe_allow_html=True)
+        else:
+            # Show a disabled state message if they already ran something manually
+            st.info("⚡ **One-Step Monthly Automations**\n\n*(Master button disabled because some automations were already posted individually).*")
+            st.markdown("<hr style='margin: 16px 0;'>", unsafe_allow_html=True)
+            
+        # Individual Bills Fallback
+        if not bills_posted:
+            st.warning(f"Notice: {len(unposted_bills)} recurring bills pending (${unposted_bills['amount'].sum():,.2f})")
+            if st.button("Post Recurring Bills Only"):
+                with get_db() as c_conn:
+                    for _, r_bill in unposted_bills.iterrows():
+                        c_conn.execute("INSERT INTO transactions (date, category, amount, note) VALUES (?, ?, ?, ?)", (selected_month_date.strftime("%Y-%m-01"), r_bill["category"], r_bill["amount"], f"[Recurring] {r_bill['name']}"))
+                        c_conn.execute("INSERT INTO posted_recurring (month, rule_id) VALUES (?, ?)", (active_month_str, int(r_bill["id"])))
+                    c_conn.commit()
+                st.session_state["pending_toast"] = f"Posted recurring bills for {selected_month_date.strftime('%B')}."
+                st.rerun()
+        else:
+            st.success("✅ Recurring bills are logged.")
+            
+    st.markdown("</div>", unsafe_allow_html=True)
+        
+    tab_exp, tab_inc, tab_sav, tab_edit, tab_import = st.tabs(["Record Expense", "Log Income", "Savings Transfer", "Edit Transactions", "Import Statement (.CSV)"])
 
     with tab_exp:
         with st.form("quick_log_form"):
@@ -734,15 +798,17 @@ elif current_tab == "+":
     with tab_inc:
         st.markdown("#### Record Inflow / Budget Boosts")
         
-        # Paycheck Quick-Log Button
-        monthly_paycheck_val = get_setting("monthly_paycheck")
         if monthly_paycheck_val > 0:
-            if st.button(f"Log Default Monthly Paycheck (${monthly_paycheck_val:,.2f})", type="primary"):
-                with get_db() as c_conn:
-                    c_conn.execute("INSERT INTO income_logs (date, amount, source) VALUES (?, ?, ?)", (date.today().isoformat(), monthly_paycheck_val, "Monthly Paycheck"))
-                    c_conn.commit()
-                st.session_state["pending_toast"] = f"💵 Paycheck logged: ${monthly_paycheck_val:,.2f}"
-                st.rerun()
+            if not paycheck_posted:
+                if st.button(f"Log Default Monthly Paycheck (${monthly_paycheck_val:,.2f})", type="primary"):
+                    with get_db() as c_conn:
+                        c_conn.execute("INSERT INTO income_logs (date, amount, source) VALUES (?, ?, ?)", (date.today().isoformat(), monthly_paycheck_val, "Monthly Paycheck"))
+                        c_conn.execute("INSERT INTO posted_paychecks (month) VALUES (?)", (active_month_str,))
+                        c_conn.commit()
+                    st.session_state["pending_toast"] = f"💵 Paycheck logged: ${monthly_paycheck_val:,.2f}"
+                    st.rerun()
+            else:
+                st.success(f"✅ Monthly paycheck for {selected_month_date.strftime('%B %Y')} is already logged.")
             st.markdown("<hr style='margin: 10px 0 20px 0;'>", unsafe_allow_html=True)
 
         with st.form("quick_income_form"):
@@ -756,10 +822,7 @@ elif current_tab == "+":
                 
             if st.form_submit_button("Log Income Deposit", type="primary", use_container_width=True):
                 with get_db() as c_conn:
-                    # Always track in overall income log
                     c_conn.execute("INSERT INTO income_logs (date, amount, source) VALUES (?, ?, ?)", (inc_date.isoformat(), inc_amt, inc_src))
-                    
-                    # Route offsets
                     if inc_dest != "None (General Income)":
                         if inc_dest.startswith("[Bucket] "):
                             b_name = inc_dest.replace("[Bucket] ", "")
@@ -769,6 +832,59 @@ elif current_tab == "+":
                             c_conn.execute("INSERT INTO category_boosts (month, category, amount, source) VALUES (?, ?, ?, ?)", (active_m, inc_dest, inc_amt, inc_src))
                     c_conn.commit()
                 st.session_state["pending_toast"] = f"💵 Income recorded: {inc_src} (${inc_amt:,.2f})"
+                st.rerun()
+
+    with tab_sav:
+        st.markdown("#### Log Savings Inflow / Outflow")
+        
+        total_monthly_savings_alloc = buckets_df["monthly_allocation"].sum()
+        if total_monthly_savings_alloc > 0:
+            if not savings_posted:
+                if st.button(f"Deposit Monthly Bucket Savings (${total_monthly_savings_alloc:,.2f})", type="primary"):
+                    deposit_date_str = selected_month_date.strftime("%Y-%m-01")
+                    with get_db() as c_conn:
+                        for _, b_row in buckets_df.iterrows():
+                            alloc_amt = float(b_row["monthly_allocation"])
+                            if alloc_amt > 0:
+                                c_conn.execute("INSERT INTO bucket_ledger (date, bucket_name, type, amount, note) VALUES (?, ?, 'Manual Deposit', ?, ?)", (deposit_date_str, b_row["name"], alloc_amt, f"Monthly Allocation for {selected_month_date.strftime('%B %Y')}"))
+                        c_conn.execute("INSERT INTO posted_bucket_deposits (month) VALUES (?)", (active_month_str,))
+                        c_conn.commit()
+                    st.session_state["pending_toast"] = f"✅ Deposited ${total_monthly_savings_alloc:,.2f} across all buckets for {selected_month_date.strftime('%B')}!"
+                    st.rerun()
+            else:
+                st.success(f"✅ Monthly savings deposits for {selected_month_date.strftime('%B %Y')} are posted.")
+            st.markdown("<hr style='margin: 10px 0 20px 0;'>", unsafe_allow_html=True)
+            
+        with st.form("manual_bucket_log"):
+            mb1, mb2, mb3, mb4 = st.columns(4)
+            with mb1:
+                m_target = st.selectbox("Bucket", buckets_df["name"].tolist())
+            with mb2:
+                m_type = st.selectbox("Action", ["Manual Deposit", "Withdrawal"])
+            with mb3:
+                m_amt = st.number_input("Amount ($)", min_value=0.01, step=10.0, format="%.2f")
+            with mb4:
+                m_dt = st.date_input("Date", value=date.today())
+            
+            m_note = st.text_input("Memo / Note")
+            split_proportional = st.checkbox("Proportionally split deposit across ALL buckets based on monthly targets (Overrides specific bucket selection)")
+
+            if st.form_submit_button("Record Entry", type="primary"):
+                with get_db() as c_conn:
+                    if m_type == "Manual Deposit" and split_proportional:
+                        tot_alloc = buckets_df["monthly_allocation"].sum()
+                        if tot_alloc > 0:
+                            for _, b_row in buckets_df.iterrows():
+                                b_alloc = float(b_row["monthly_allocation"])
+                                if b_alloc > 0:
+                                    s_amt = m_amt * (b_alloc / tot_alloc)
+                                    final_note = f"{m_note} (Proportional Split)" if m_note else "Proportional Split"
+                                    c_conn.execute("INSERT INTO bucket_ledger (date, bucket_name, type, amount, note) VALUES (?, ?, 'Manual Deposit', ?, ?)", (m_dt.isoformat(), b_row["name"], s_amt, final_note))
+                        st.session_state["pending_toast"] = f"🏦 ${m_amt:,.2f} proportionally distributed across all buckets."
+                    else:
+                        c_conn.execute("INSERT INTO bucket_ledger (date, bucket_name, type, amount, note) VALUES (?, ?, ?, ?, ?)", (m_dt.isoformat(), m_target, m_type, m_amt, m_note))
+                        st.session_state["pending_toast"] = f"{m_type} of ${m_amt:,.2f} recorded for {m_target}."
+                    c_conn.commit()
                 st.rerun()
 
     with tab_edit:
@@ -860,29 +976,6 @@ elif current_tab == "+":
 elif current_tab == "Savings":
     st.markdown("### Savings & Sinking Funds")
 
-    posted_bucket_rec = pd.read_sql("SELECT 1 FROM posted_bucket_deposits WHERE month = ?", conn, params=(active_month_str,))
-    deposits_already_posted = not posted_bucket_rec.empty
-    total_monthly_savings_alloc = buckets_df["monthly_allocation"].sum()
-
-    if not deposits_already_posted:
-        st.warning(f"Notice: Monthly savings contributions for {selected_month_date.strftime('%B %Y')} (${total_monthly_savings_alloc:,.2f}) have not been posted yet.")
-        if st.button(f"Deposit Monthly Bucket Savings (${total_monthly_savings_alloc:,.2f})", type="primary"):
-            deposit_date = selected_month_date.strftime("%Y-%m-01")
-            with get_db() as c_conn:
-                for _, b_row in buckets_df.iterrows():
-                    alloc_amt = float(b_row["monthly_allocation"])
-                    if alloc_amt > 0:
-                        c_conn.execute(
-                            "INSERT INTO bucket_ledger (date, bucket_name, type, amount, note) VALUES (?, ?, 'Manual Deposit', ?, ?)",
-                            (deposit_date, b_row["name"], alloc_amt, f"Monthly Allocation for {selected_month_date.strftime('%B %Y')}")
-                        )
-                c_conn.execute("INSERT INTO posted_bucket_deposits (month) VALUES (?)", (active_month_str,))
-                c_conn.commit()
-            st.session_state["pending_toast"] = f"✅ Deposited ${total_monthly_savings_alloc:,.2f} across all buckets for {selected_month_date.strftime('%B')}!"
-            st.rerun()
-    else:
-        st.success(f"✅ Monthly savings deposits for {selected_month_date.strftime('%B %Y')} are posted.")
-
     b_rows = []
     for _, b in buckets_df.iterrows():
         b_name = b["name"]
@@ -969,39 +1062,6 @@ elif current_tab == "Savings":
             margin=dict(l=10, r=40, t=10, b=10),
         )
         st.plotly_chart(fig_solv, use_container_width=True, config={"displayModeBar": False})
-
-    st.markdown("#### Log Savings Inflow / Outflow")
-    with st.form("manual_bucket_log"):
-        mb1, mb2, mb3, mb4 = st.columns(4)
-        with mb1:
-            m_target = st.selectbox("Bucket", buckets_df["name"].tolist())
-        with mb2:
-            m_type = st.selectbox("Action", ["Manual Deposit", "Withdrawal"])
-        with mb3:
-            m_amt = st.number_input("Amount ($)", min_value=0.01, step=10.0, format="%.2f")
-        with mb4:
-            m_dt = st.date_input("Date", value=date.today())
-        
-        m_note = st.text_input("Memo / Note")
-        split_proportional = st.checkbox("Proportionally split deposit across ALL buckets based on monthly targets (Overrides specific bucket selection)")
-
-        if st.form_submit_button("Record Entry", type="primary"):
-            with get_db() as c_conn:
-                if m_type == "Manual Deposit" and split_proportional:
-                    tot_alloc = buckets_df["monthly_allocation"].sum()
-                    if tot_alloc > 0:
-                        for _, b_row in buckets_df.iterrows():
-                            b_alloc = float(b_row["monthly_allocation"])
-                            if b_alloc > 0:
-                                s_amt = m_amt * (b_alloc / tot_alloc)
-                                final_note = f"{m_note} (Proportional Split)" if m_note else "Proportional Split"
-                                c_conn.execute("INSERT INTO bucket_ledger (date, bucket_name, type, amount, note) VALUES (?, ?, 'Manual Deposit', ?, ?)", (m_dt.isoformat(), b_row["name"], s_amt, final_note))
-                    st.session_state["pending_toast"] = f"🏦 ${m_amt:,.2f} proportionally distributed across all buckets."
-                else:
-                    c_conn.execute("INSERT INTO bucket_ledger (date, bucket_name, type, amount, note) VALUES (?, ?, ?, ?, ?)", (m_dt.isoformat(), m_target, m_type, m_amt, m_note))
-                    st.session_state["pending_toast"] = f"{m_type} of ${m_amt:,.2f} recorded for {m_target}."
-                c_conn.commit()
-            st.rerun()
 
     st.markdown("#### Manage Past Bucket Entries")
     with st.expander("✏️ View & Edit Past Savings Ledger", expanded=False):
