@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Created on Sat Aug 15 21:07:00 2026
-Updated Wed Sep 2
-
+Updated Fri Nov 6 2026
 @author: evansims
 """
 from datetime import date, datetime
@@ -617,102 +616,152 @@ if current_tab == "Home":
 elif current_tab == "Analysis":
     st.markdown("### Spending Analysis")
     
-    an_col1, an_col2 = st.columns(2, gap="large")
-    with an_col1:
-        st.markdown("<div class='card-shell'><p class='card-shell-header'>Net Budget Performance & Cumulative Trajectory</p>", unsafe_allow_html=True)
-        if not trans_df.empty:
-            total_monthly_base_target = cats_df["monthly_target"].sum()
-            
-            all_boosts_df = pd.read_sql("SELECT month, SUM(amount) as total_boost FROM category_boosts GROUP BY month", conn)
-            month_totals = trans_df.groupby("month")["amount"].sum().reset_index().sort_values("month")
-            month_totals = pd.merge(month_totals, all_boosts_df, on="month", how="left").fillna(0)
-            month_totals["effective_target"] = total_monthly_base_target + month_totals["total_boost"]
-            
-            month_totals["net_difference"] = month_totals["effective_target"] - month_totals["amount"]
-            month_totals["cumulative_net"] = month_totals["net_difference"].cumsum()
-            month_totals["color"] = month_totals["net_difference"].apply(lambda v: "#0f3923" if v >= 0 else "#E74C3C")
-            
-            fig_trend = make_subplots(specs=[[{"secondary_y": True}]])
-            
-            fig_trend.add_trace(
-                go.Bar(
-                    x=month_totals["month"],
-                    y=month_totals["net_difference"],
-                    name="Net Month Diff",
-                    marker_color=month_totals["color"],
-                    hovertemplate="%{x}<br>Net: $%{y:,.2f}<extra></extra>"
-                ),
-                secondary_y=False
-            )
-            
-            fig_trend.add_trace(
-                go.Scatter(
-                    x=month_totals["month"],
-                    y=month_totals["cumulative_net"],
-                    name="Cumulative Net",
-                    mode="lines+markers",
-                    line=dict(color="#54A0FF", width=3),
-                    marker=dict(size=7, color="#54A0FF"),
-                    hovertemplate="%{x}<br>Cumulative Net: $%{y:,.2f}<extra></extra>"
-                ),
-                secondary_y=True
-            )
-            
-            fig_trend.update_layout(
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)",
-                xaxis=dict(title="Month", showgrid=False),
-                yaxis=dict(
-                    title=dict(text="Monthly Variance ($)", font=dict(color="#0f3923")),
-                    tickfont=dict(color="#0f3923"),
-                    zeroline=True,
-                    zerolinewidth=2,
-                    zerolinecolor="#6C7E76",
-                    showgrid=True,
-                    gridcolor="rgba(0,0,0,0.06)"
-                ),
-                yaxis2=dict(
-                    title=dict(text="Cumulative Position ($)", font=dict(color="#54A0FF")),
-                    tickfont=dict(color="#54A0FF"),
-                    showgrid=False,
-                    overlaying="y",
-                    side="right"
-                ),
-                height=360,
-                margin=dict(l=10, r=10, t=20, b=10),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-            )
-            st.plotly_chart(fig_trend, use_container_width=True, config={"displayModeBar": False})
-        else:
-            st.info("Record transactions to populate net monthly trends.")
-        st.markdown("</div>", unsafe_allow_html=True)
+    # 1. Combo Chart (Full Width, Top)
+    st.markdown("<div class='card-shell'><p class='card-shell-header'>Trend & Cumulative Trajectory</p>", unsafe_allow_html=True)
+    
+    # Changed from st.radio to st.selectbox to avoid conflicting with the bottom nav bar CSS
+    trend_mode = st.selectbox("Select Trend Metric", ["Net Budget Performance (Target vs. Spent)", "Net Income (Income vs. All Expenses + Buckets)"], label_visibility="collapsed")
+    
+    # Safely prepare month columns for aggregations
+    if not trans_df.empty and "month" not in trans_df.columns:
+        trans_df["month"] = pd.to_datetime(trans_df["date"]).dt.strftime("%Y-%m")
+    if not bucket_ledger_df.empty and "month" not in bucket_ledger_df.columns:
+        bucket_ledger_df["month"] = pd.to_datetime(bucket_ledger_df["date"]).dt.strftime("%Y-%m")
+    if not income_df.empty and "month" not in income_df.columns:
+        income_df["month"] = pd.to_datetime(income_df["date"]).dt.strftime("%Y-%m")
 
-    with an_col2:
-        st.markdown(f"<div class='card-shell'><p class='card-shell-header'>Category Breakdown ({selected_month_date.strftime('%B %Y')})</p>", unsafe_allow_html=True)
-        if not month_trans.empty:
-            cat_totals = month_trans.groupby("category")["amount"].sum().reset_index()
-            fig_pie = px.pie(
-                cat_totals,
-                values="amount",
-                names="category",
-                hole=0.45,
-                color_discrete_sequence=["#0f3923", "#1A5638", "#257A50", "#36A16D", "#4CC98D", "#E37463", "#FF9F43", "#54A0FF"],
-            )
-            fig_pie.update_traces(
-                textposition="outside",
-                textinfo="percent+label",
-                rotation=0,
-                direction="clockwise",
-            )
-            fig_pie.update_layout(
-                showlegend=False,
-                height=390,
-                margin=dict(l=65, r=65, t=25, b=45),
-            )
-            st.plotly_chart(fig_pie, use_container_width=True, config={"displayModeBar": False})
+    mo_exp = trans_df.groupby("month")["amount"].sum().reset_index().rename(columns={"amount": "reg_spent"}) if not trans_df.empty else pd.DataFrame(columns=["month", "reg_spent"])
+    mo_b_with = bucket_ledger_df[bucket_ledger_df["type"] == "Withdrawal"].groupby("month")["amount"].sum().reset_index().rename(columns={"amount": "bucket_spent"}) if not bucket_ledger_df.empty else pd.DataFrame(columns=["month", "bucket_spent"])
+    mo_inc = income_df.groupby("month")["amount"].sum().reset_index().rename(columns={"amount": "total_income"}) if not income_df.empty else pd.DataFrame(columns=["month", "total_income"])
+    all_boosts_df = pd.read_sql("SELECT month, SUM(amount) as total_boost FROM category_boosts GROUP BY month", conn)
+
+    all_months = set(mo_exp["month"].tolist() + mo_b_with["month"].tolist() + mo_inc["month"].tolist() + all_boosts_df["month"].tolist())
+    month_totals = pd.DataFrame({"month": sorted(list(all_months))})
+
+    if not month_totals.empty:
+        total_monthly_base_target = cats_df["monthly_target"].sum()
+        month_totals = pd.merge(month_totals, mo_exp, on="month", how="left").fillna(0)
+        month_totals = pd.merge(month_totals, mo_b_with, on="month", how="left").fillna(0)
+        month_totals = pd.merge(month_totals, mo_inc, on="month", how="left").fillna(0)
+        month_totals = pd.merge(month_totals, all_boosts_df, on="month", how="left").fillna(0)
+        
+        month_totals["effective_target"] = total_monthly_base_target + month_totals["total_boost"]
+        
+        if "Net Income" in trend_mode:
+            month_totals["net_val"] = month_totals["total_income"] - (month_totals["reg_spent"] + month_totals["bucket_spent"])
+            y1_title = "Net Cash Flow ($)"
         else:
-            st.info("No expenses to chart for this month.")
-        st.markdown("</div>", unsafe_allow_html=True)
+            month_totals["net_val"] = month_totals["effective_target"] - month_totals["reg_spent"]
+            y1_title = "Monthly Variance ($)"
+
+        month_totals["cumulative_net"] = month_totals["net_val"].cumsum()
+        month_totals["color"] = month_totals["net_val"].apply(lambda v: "#0f3923" if v >= 0 else "#E74C3C")
+        
+        fig_trend = make_subplots(specs=[[{"secondary_y": True}]])
+        
+        fig_trend.add_trace(
+            go.Bar(
+                x=month_totals["month"],
+                y=month_totals["net_val"],
+                name=y1_title.split(" (")[0],
+                marker_color=month_totals["color"],
+                hovertemplate="%{x}<br>Net: $%{y:,.2f}<extra></extra>"
+            ),
+            secondary_y=False
+        )
+        
+        fig_trend.add_trace(
+            go.Scatter(
+                x=month_totals["month"],
+                y=month_totals["cumulative_net"],
+                name="Cumulative Net",
+                mode="lines+markers",
+                line=dict(color="#54A0FF", width=3),
+                marker=dict(size=7, color="#54A0FF"),
+                hovertemplate="%{x}<br>Cumulative Net: $%{y:,.2f}<extra></extra>"
+            ),
+            secondary_y=True
+        )
+        
+        fig_trend.update_layout(
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            xaxis=dict(title="Month", showgrid=False),
+            yaxis=dict(
+                title=dict(text=y1_title, font=dict(color="#0f3923")),
+                tickfont=dict(color="#0f3923"),
+                zeroline=True,
+                zerolinewidth=2,
+                zerolinecolor="#6C7E76",
+                showgrid=True,
+                gridcolor="rgba(0,0,0,0.06)"
+            ),
+            yaxis2=dict(
+                title=dict(text="Cumulative Position ($)", font=dict(color="#54A0FF")),
+                tickfont=dict(color="#54A0FF"),
+                showgrid=False,
+                overlaying="y",
+                side="right"
+            ),
+            height=400,
+            margin=dict(l=10, r=10, t=20, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(fig_trend, use_container_width=True, config={"displayModeBar": False})
+    else:
+        st.info("Record transactions or income to populate trends.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # 2. Pie Chart (Full Width, Bottom)
+    st.markdown(f"<div class='card-shell'><p class='card-shell-header'>Category Breakdown ({selected_month_date.strftime('%B %Y')})</p>", unsafe_allow_html=True)
+    
+    # Checkbox logic linked to the Trend Mode toggle
+    is_net_income = "Net Income" in trend_mode
+    include_buckets_pie = st.checkbox(
+        "Include Savings Bucket Expenses", 
+        value=True, 
+        disabled=is_net_income,
+        help="Forced on when viewing Net Income trajectory." if is_net_income else None
+    )
+    
+    # Evaluate final inclusion state
+    show_buckets = True if is_net_income else include_buckets_pie
+    
+    pie_data = month_trans[["category", "amount"]].copy()
+    
+    if show_buckets and not bucket_ledger_df.empty:
+        if "month" not in bucket_ledger_df.columns:
+            bucket_ledger_df["month"] = pd.to_datetime(bucket_ledger_df["date"]).dt.strftime("%Y-%m")
+        active_b_withdrawals = bucket_ledger_df[(bucket_ledger_df["month"] == active_month_str) & (bucket_ledger_df["type"] == "Withdrawal")]
+        if not active_b_withdrawals.empty:
+            b_data = active_b_withdrawals[["bucket_name", "amount"]].rename(columns={"bucket_name": "category"})
+            b_data["category"] = "[Bucket] " + b_data["category"]
+            pie_data = pd.concat([pie_data, b_data], ignore_index=True)
+
+    if not pie_data.empty:
+        cat_totals = pie_data.groupby("category")["amount"].sum().reset_index()
+        fig_pie = px.pie(
+            cat_totals,
+            values="amount",
+            names="category",
+            hole=0.45,
+            color_discrete_sequence=["#0f3923", "#1A5638", "#257A50", "#36A16D", "#4CC98D", "#E37463", "#FF9F43", "#54A0FF", "#34495E", "#9B59B6", "#F1C40F", "#E67E22", "#95A5A6"],
+        )
+        fig_pie.update_traces(
+            textposition="outside",
+            textinfo="percent+label",
+            rotation=0,
+            direction="clockwise",
+        )
+        fig_pie.update_layout(
+            showlegend=False,
+            height=460,
+            margin=dict(l=40, r=40, t=140, b=40),
+        )
+        st.plotly_chart(fig_pie, use_container_width=True, config={"displayModeBar": False})
+    else:
+        st.info("No expenses to chart for this month.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # ==============================================================================
 # ACTION MODAL: +
@@ -802,7 +851,9 @@ elif current_tab == "+":
             if not paycheck_posted:
                 if st.button(f"Log Default Monthly Paycheck (${monthly_paycheck_val:,.2f})", type="primary"):
                     with get_db() as c_conn:
-                        c_conn.execute("INSERT INTO income_logs (date, amount, source) VALUES (?, ?, ?)", (date.today().isoformat(), monthly_paycheck_val, "Monthly Paycheck"))
+                        # Modified to log exactly to the month selected in the top-right horizon
+                        deposit_date_str = selected_month_date.strftime("%Y-%m-01")
+                        c_conn.execute("INSERT INTO income_logs (date, amount, source) VALUES (?, ?, ?)", (deposit_date_str, monthly_paycheck_val, "Monthly Paycheck"))
                         c_conn.execute("INSERT INTO posted_paychecks (month) VALUES (?)", (active_month_str,))
                         c_conn.commit()
                     st.session_state["pending_toast"] = f"💵 Paycheck logged: ${monthly_paycheck_val:,.2f}"
@@ -817,7 +868,10 @@ elif current_tab == "+":
                 inc_src = st.text_input("Income Source (e.g., Bonus, Gift)")
                 inc_amt = st.number_input("Amount Received ($)", min_value=0.01, step=50.0, format="%.2f")
             with i2:
-                inc_date = st.date_input("Deposit Date", value=date.today())
+                # Intelligently default to the month being viewed in the top right
+                default_inc_date = current_dt if (selected_month_date.month == current_dt.month and selected_month_date.year == current_dt.year) else selected_month_date
+                
+                inc_date = st.date_input("Deposit Date", value=default_inc_date)
                 inc_dest = st.selectbox("Target Category / Bucket (Optional for Offset)", ["None (General Income)"] + all_destinations)
                 
             if st.form_submit_button("Log Income Deposit", type="primary", use_container_width=True):
@@ -834,6 +888,39 @@ elif current_tab == "+":
                 st.session_state["pending_toast"] = f"💵 Income recorded: {inc_src} (${inc_amt:,.2f})"
                 st.rerun()
 
+        st.markdown("#### Manage Logged Income")
+        with st.expander("✏️ View & Edit Past Income", expanded=False):
+            if not income_df.empty:
+                edit_inc_df = income_df[["id", "date", "source", "amount"]].sort_values(by="date", ascending=False).copy()
+                edit_inc_df["date"] = pd.to_datetime(edit_inc_df["date"]).dt.date
+
+                updated_inc_df = st.data_editor(
+                    edit_inc_df,
+                    key="income_table_editor",
+                    column_config={
+                        "id": st.column_config.NumberColumn("ID", disabled=True),
+                        "date": st.column_config.DateColumn("Date", required=True),
+                        "source": st.column_config.TextColumn("Source", required=True),
+                        "amount": st.column_config.NumberColumn("Amount ($)", format="$%.2f", required=True),
+                    },
+                    use_container_width=True,
+                    num_rows="dynamic",
+                )
+                if st.button("Save Changes to Income", type="primary"):
+                    with get_db() as c_conn:
+                        c_conn.execute("DELETE FROM income_logs")
+                        for _, r in updated_inc_df.iterrows():
+                            if pd.notna(r["amount"]) and float(r["amount"]) > 0:
+                                c_conn.execute(
+                                    "INSERT INTO income_logs (id, date, source, amount) VALUES (?, ?, ?, ?)",
+                                    (int(r["id"]) if pd.notna(r["id"]) else None, str(r["date"]), str(r["source"]), float(r["amount"]))
+                                )
+                        c_conn.commit()
+                    st.session_state["pending_toast"] = "💾 Income ledger updated successfully!"
+                    st.rerun()
+            else:
+                st.info("No income logged in the database yet.")
+                
     with tab_sav:
         st.markdown("#### Log Savings Inflow / Outflow")
         
